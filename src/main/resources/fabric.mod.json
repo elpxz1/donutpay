@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "donutpay",
+  "version": "${version}",
+  "name": "DonutPay",
+  "description": "Shows clickable 2x / Bal / Payback buttons when someone pays you.",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.donutpay.DonutPayClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "1.21.11",
+    "fabric-api": "*"
+  }
+}
