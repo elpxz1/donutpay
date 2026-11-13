@@ -35,7 +35,10 @@ public class DonutPayClient implements ClientModInitializer {
 
     // "Steve paid you $200K"  (whole line must match, so players can't fake it by typing it mid-sentence)
     private static final Pattern PAID = Pattern.compile(
-            "^(\\w{3,16}) (?:has )?(?:paid|sent) you \\$?([\\d,]*\\.?\\d+)\\s*([kKmMbBtT]?)\\.?!?$");
+            "^\\W*(\\w{3,16})\\s+(?:has\\s+)?(?:paid|sent)\\s+you\\s+(?:a total of\\s+)?\\$?\\s*([\\d,]*\\.?\\d+)\\s*([kKmMbBtT]?)\\b.{0,40}$",
+            Pattern.CASE_INSENSITIVE);
+
+    private static boolean debug = false;
 
     private static final Map<Integer, Payment> PAYMENTS = new LinkedHashMap<>() {
         @Override
@@ -61,7 +64,11 @@ public class DonutPayClient implements ClientModInitializer {
         // GAME = server/system messages only. Player chat is ignored on purpose (spoof protection).
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
             if (overlay) return;
-            handle(message.getString());
+            handle(message.getString(), "GAME");
+        });
+        // Some servers send plugin messages through the chat packet. Only accept those with NO player sender.
+        ClientReceiveMessageEvents.CHAT.register((message, signed, sender, params, ts) -> {
+            handle(message.getString(), sender == null ? "CHAT" : "PLAYER-CHAT");
         });
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
@@ -75,6 +82,12 @@ public class DonutPayClient implements ClientModInitializer {
                                                         StringArgumentType.getString(ctx, "action"));
                                                 return 1;
                                             }))))
+                    .then(ClientCommandManager.literal("debug")
+                            .executes(ctx -> {
+                                debug = !debug;
+                                info("Debug " + (debug ? "ON - pay messages will be shown as RAW" : "OFF"));
+                                return 1;
+                            }))
                     // /dpay test <name> <amount>  -> fake a payment to see the buttons
                     .then(ClientCommandManager.literal("test")
                             .then(ClientCommandManager.argument("name", StringArgumentType.word())
@@ -87,11 +100,18 @@ public class DonutPayClient implements ClientModInitializer {
         });
     }
 
-    private static void handle(String raw) {
+    private static void handle(String raw, String source) {
         String s = Formatting.strip(raw);
         if (s == null) return;
+        if (debug) {
+            String low = s.toLowerCase();
+            if (low.contains("paid") || low.contains("pay") || low.contains("sent") || low.contains("$")) {
+                MinecraftClient.getInstance().execute(() -> info("RAW [" + source + "]: " + s));
+            }
+        }
+        if (source.equals("PLAYER-CHAT")) return;
         Matcher m = PAID.matcher(s.trim());
-        if (!m.matches()) return;
+        if (!m.find()) return;
 
         long amount = parseAmount(m.group(2), m.group(3));
         if (amount <= 0) return;
