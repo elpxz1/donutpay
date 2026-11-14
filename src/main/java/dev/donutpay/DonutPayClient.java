@@ -182,9 +182,10 @@ public class DonutPayClient implements ClientModInitializer {
         String s = Formatting.strip(raw);
         if (s == null) return;
         if (debug) {
+            final String shown = s;
             String low = s.toLowerCase();
             if (low.contains("paid") || low.contains("pay") || low.contains("sent") || low.contains("$")) {
-                MinecraftClient.getInstance().execute(() -> info("RAW [" + source + "]: " + s));
+                MinecraftClient.getInstance().execute(() -> info("RAW [" + source + "]: " + shown));
             }
         }
         if (source.equals("PLAYER-CHAT")) return;
