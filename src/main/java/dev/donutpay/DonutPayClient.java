@@ -29,7 +29,11 @@ import org.lwjgl.glfw.GLFW;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -37,8 +41,9 @@ import java.util.regex.Pattern;
 /**
  * DonutPay
  *  - Orange [2x] [Bal] [Payback] buttons when someone pays you.
- *  - /dpay            opens the settings GUI (colors, HUD editor, session buttons)
- *  - /dpay start|stop starts / ends a profit-tracking session (HUD only shows during a session)
+ *  - /dpay            opens the settings GUI (General tab + Top Gamblers tab)
+ *  - /dpay start|stop starts / ends a profit-tracking session (the panels only show during a session)
+ *  - Top Gamblers panel = who paid you the most during the current session
  *  - Nothing is ever sent automatically: every payment needs a click from you.
  */
 public class DonutPayClient implements ClientModInitializer {
@@ -47,12 +52,35 @@ public class DonutPayClient implements ClientModInitializer {
     static final String[] COLOR_NAMES = {"Orange", "Red", "Yellow", "Green", "Aqua", "Blue", "Purple", "Pink", "White"};
     static final int[] COLOR_VALUES = {0xFFA500, 0xFF5555, 0xFFFF55, 0x55FF55, 0x55FFFF, 0x5555FF, 0xAA55FF, 0xFF55FF, 0xFFFFFF};
 
+    // ------------------------------------------------------------------ HUD panels
+    /** Position / size / color of one on-screen panel. */
+    static final class PanelCfg {
+        final int defX, defY;
+        int x, y, color;
+        float scale = 1.0f;
+
+        PanelCfg(int x, int y, int color) {
+            this.defX = x;
+            this.defY = y;
+            this.x = x;
+            this.y = y;
+            this.color = color;
+        }
+
+        void resetPosition() {
+            x = defX;
+            y = defY;
+            scale = 1.0f;
+        }
+    }
+
+    static final PanelCfg PROFIT = new PanelCfg(5, 40, 0xFFA500);
+    static final PanelCfg GAMBLERS = new PanelCfg(5, 105, 0xFFA500);
+
     // ------------------------------------------------------------------ saved settings
     static int buttonColor = 0xFFA500;
-    static int hudColor = 0xFFA500;
-    static int hudX = 5;
-    static int hudY = 40;
-    static float hudScale = 1.0f;
+    static boolean gamblersEnabled = true;
+    static int gamblerCount = 5;
 
     // ------------------------------------------------------------------ session
     static boolean active = false;
@@ -62,6 +90,8 @@ public class DonutPayClient implements ClientModInitializer {
     static long taxPaid = 0;
     static int countIn = 0;
     static int countOut = 0;
+    /** player name -> total they paid you during this session */
+    static final Map<String, Long> gamblers = new HashMap<>();
 
     private static boolean debug = false;
     private static boolean openGui = false;
@@ -120,13 +150,15 @@ public class DonutPayClient implements ClientModInitializer {
             }
         });
 
-        // Profit HUD
+        // HUD panels
         HudRenderCallback.EVENT.register((ctx, tickCounter) -> {
             MinecraftClient mc = MinecraftClient.getInstance();
             if (mc.options.hudHidden) return;
             if (!active) return;
-            if (mc.currentScreen instanceof HudEditScreen) return; // the editor draws it itself
-            drawHud(ctx, mc);
+            // the editor draws the panel it is editing by itself
+            PanelCfg editing = mc.currentScreen instanceof HudEditScreen e ? e.panel : null;
+            if (editing != PROFIT) drawPanel(ctx, mc, PROFIT, false);
+            if (gamblersEnabled && editing != GAMBLERS) drawPanel(ctx, mc, GAMBLERS, false);
         });
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
@@ -150,6 +182,12 @@ public class DonutPayClient implements ClientModInitializer {
                         .then(ClientCommandManager.literal("reset").executes(ctx -> {
                             resetSession();
                             info("Session numbers reset.");
+                            return 1;
+                        }))
+                        .then(ClientCommandManager.literal("gamblers").executes(ctx -> {
+                            gamblersEnabled = !gamblersEnabled;
+                            saveConfig();
+                            info("Top Gamblers panel " + (gamblersEnabled ? "ON" : "OFF"));
                             return 1;
                         }))
                         .then(ClientCommandManager.literal("debug").executes(ctx -> {
@@ -215,11 +253,12 @@ public class DonutPayClient implements ClientModInitializer {
 
         long amount = parseAmount(m.group(2), m.group(3));
         if (amount <= 0) return;
+        String name = m.group(1);
         if (active) {
             received += amount;
             countIn++;
+            gamblers.merge(name, amount, Long::sum);
         }
-        String name = m.group(1);
         MinecraftClient.getInstance().execute(() -> show(name, amount));
     }
 
@@ -305,8 +344,13 @@ public class DonutPayClient implements ClientModInitializer {
             return;
         }
         active = false;
+        String top = "";
+        List<Map.Entry<String, Long>> list = topGamblers(1);
+        if (!list.isEmpty()) {
+            top = " Top gambler: " + list.get(0).getKey() + " ($" + compact(list.get(0).getValue()) + ").";
+        }
         info("Session ended: received $" + compact(received) + ", paid out $" + compact(paidOut + taxPaid)
-                + ", profit " + signedMoney(profit()) + " in " + elapsedText() + ".");
+                + ", profit " + signedMoney(profit()) + " in " + elapsedText() + "." + top);
     }
 
     static void resetSession() {
@@ -315,6 +359,7 @@ public class DonutPayClient implements ClientModInitializer {
         taxPaid = 0;
         countIn = 0;
         countOut = 0;
+        gamblers.clear();
         startMs = System.currentTimeMillis();
     }
 
@@ -332,65 +377,103 @@ public class DonutPayClient implements ClientModInitializer {
         return (v < 0 ? "-$" : "$") + compact(Math.abs(v));
     }
 
+    /** The players who paid you the most this session, biggest first. */
+    static List<Map.Entry<String, Long>> topGamblers(int limit) {
+        List<Map.Entry<String, Long>> list = new ArrayList<>(gamblers.entrySet());
+        list.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
+        if (list.size() > limit) list = new ArrayList<>(list.subList(0, limit));
+        return list;
+    }
+
     // ================================================================== HUD drawing
     private static final int PAD = 4;
     private static final int LINE_H = 10;
 
-    private static String[] hudLines() {
-        return new String[]{
-                "DonutPay Profit",
-                "Received: $" + compact(received) + " (" + countIn + ")",
-                "Paid out: $" + compact(paidOut + taxPaid) + " (" + countOut + ")",
-                "Profit: " + signedMoney(profit()),
-                "Time: " + elapsedText()
-        };
+    private static String[] panelLines(PanelCfg p, boolean preview) {
+        if (p == PROFIT) {
+            return new String[]{
+                    "DonutPay Profit",
+                    "Received: $" + compact(received) + " (" + countIn + ")",
+                    "Paid out: $" + compact(paidOut + taxPaid) + " (" + countOut + ")",
+                    "Profit: " + signedMoney(profit()),
+                    "Time: " + elapsedText()
+            };
+        }
+        List<Map.Entry<String, Long>> top = topGamblers(gamblerCount);
+        if (top.isEmpty() && preview) {
+            top = new ArrayList<>();
+            top.add(new AbstractMap.SimpleEntry<>("Steve", 50000L));
+            top.add(new AbstractMap.SimpleEntry<>("Alex", 20000L));
+            top.add(new AbstractMap.SimpleEntry<>("Notch", 5000L));
+        }
+        if (top.isEmpty()) {
+            return new String[]{"Top Gamblers", "No payments yet"};
+        }
+        String[] out = new String[top.size() + 1];
+        out[0] = "Top Gamblers";
+        for (int i = 0; i < top.size(); i++) {
+            out[i + 1] = (i + 1) + ". " + top.get(i).getKey() + "  $" + compact(top.get(i).getValue());
+        }
+        return out;
     }
 
-    private static int[] hudLineColors() {
-        return new int[]{hudColor, 0x55FF55, 0xFF5555, profit() >= 0 ? 0x55FF55 : 0xFF5555, 0xAAAAAA};
+    private static int[] panelColors(PanelCfg p, String[] lines) {
+        int[] c = new int[lines.length];
+        if (p == PROFIT) {
+            c[0] = p.color;
+            c[1] = 0x55FF55;
+            c[2] = 0xFF5555;
+            c[3] = profit() >= 0 ? 0x55FF55 : 0xFF5555;
+            c[4] = 0xAAAAAA;
+            return c;
+        }
+        c[0] = p.color;
+        for (int i = 1; i < c.length; i++) c[i] = 0xFFFFFF;
+        if (lines.length == 2 && lines[1].equals("No payments yet")) c[1] = 0xAAAAAA;
+        return c;
     }
 
-    static int hudBaseWidth(TextRenderer tr) {
+    static int panelBaseWidth(TextRenderer tr, String[] lines) {
         int w = 0;
-        for (String l : hudLines()) w = Math.max(w, tr.getWidth(l));
+        for (String l : lines) w = Math.max(w, tr.getWidth(l));
         return w + PAD * 2;
     }
 
-    static int hudBaseHeight() {
-        return hudLines().length * LINE_H + PAD * 2 - 1;
+    static int panelBaseHeight(String[] lines) {
+        return lines.length * LINE_H + PAD * 2 - 1;
     }
 
-    static int hudWidth(TextRenderer tr) {
-        return Math.round(hudBaseWidth(tr) * hudScale);
+    static int panelWidth(MinecraftClient mc, PanelCfg p, boolean preview) {
+        return Math.round(panelBaseWidth(mc.textRenderer, panelLines(p, preview)) * p.scale);
     }
 
-    static int hudHeight() {
-        return Math.round(hudBaseHeight() * hudScale);
+    static int panelHeight(PanelCfg p, boolean preview) {
+        return Math.round(panelBaseHeight(panelLines(p, preview)) * p.scale);
     }
 
-    static void clampHud(MinecraftClient mc, int screenW, int screenH) {
-        int w = hudWidth(mc.textRenderer);
-        int h = hudHeight();
-        hudX = Math.max(0, Math.min(hudX, Math.max(0, screenW - w)));
-        hudY = Math.max(0, Math.min(hudY, Math.max(0, screenH - h)));
+    static void clampPanel(MinecraftClient mc, PanelCfg p, int screenW, int screenH, boolean preview) {
+        int w = panelWidth(mc, p, preview);
+        int h = panelHeight(p, preview);
+        p.x = Math.max(0, Math.min(p.x, Math.max(0, screenW - w)));
+        p.y = Math.max(0, Math.min(p.y, Math.max(0, screenH - h)));
     }
 
-    static void drawHud(DrawContext ctx, MinecraftClient mc) {
+    static void drawPanel(DrawContext ctx, MinecraftClient mc, PanelCfg p, boolean preview) {
         TextRenderer tr = mc.textRenderer;
-        clampHud(mc, ctx.getScaledWindowWidth(), ctx.getScaledWindowHeight());
+        clampPanel(mc, p, ctx.getScaledWindowWidth(), ctx.getScaledWindowHeight(), preview);
 
-        String[] lines = hudLines();
-        int[] colors = hudLineColors();
-        int w = hudBaseWidth(tr);
-        int h = hudBaseHeight();
+        String[] lines = panelLines(p, preview);
+        int[] colors = panelColors(p, lines);
+        int w = panelBaseWidth(tr, lines);
+        int h = panelBaseHeight(lines);
 
         var m = ctx.getMatrices();
         m.pushMatrix();
-        m.translate((float) hudX, (float) hudY);
-        m.scale(hudScale, hudScale);
+        m.translate((float) p.x, (float) p.y);
+        m.scale(p.scale, p.scale);
 
         ctx.fill(0, 0, w, h, 0xB0000000);
-        ctx.drawStrokedRectangle(0, 0, w, h, 0xFF000000 | hudColor);
+        ctx.drawStrokedRectangle(0, 0, w, h, 0xFF000000 | p.color);
         for (int i = 0; i < lines.length; i++) {
             ctx.drawText(tr, lines[i], PAD, PAD + i * LINE_H, 0xFF000000 | colors[i], true);
         }
@@ -402,16 +485,26 @@ public class DonutPayClient implements ClientModInitializer {
         return FabricLoader.getInstance().getConfigDir().resolve("donutpay.json");
     }
 
+    private static float clampScale(float s) {
+        return Math.max(0.5f, Math.min(3.0f, s));
+    }
+
     static void loadConfig() {
         try {
             Path p = configPath();
             if (!Files.exists(p)) return;
             JsonObject o = JsonParser.parseString(Files.readString(p)).getAsJsonObject();
             if (o.has("buttonColor")) buttonColor = o.get("buttonColor").getAsInt();
-            if (o.has("hudColor")) hudColor = o.get("hudColor").getAsInt();
-            if (o.has("hudX")) hudX = o.get("hudX").getAsInt();
-            if (o.has("hudY")) hudY = o.get("hudY").getAsInt();
-            if (o.has("hudScale")) hudScale = Math.max(0.5f, Math.min(3.0f, o.get("hudScale").getAsFloat()));
+            if (o.has("hudColor")) PROFIT.color = o.get("hudColor").getAsInt();
+            if (o.has("hudX")) PROFIT.x = o.get("hudX").getAsInt();
+            if (o.has("hudY")) PROFIT.y = o.get("hudY").getAsInt();
+            if (o.has("hudScale")) PROFIT.scale = clampScale(o.get("hudScale").getAsFloat());
+            if (o.has("gamblersEnabled")) gamblersEnabled = o.get("gamblersEnabled").getAsBoolean();
+            if (o.has("gamblerColor")) GAMBLERS.color = o.get("gamblerColor").getAsInt();
+            if (o.has("gamblerX")) GAMBLERS.x = o.get("gamblerX").getAsInt();
+            if (o.has("gamblerY")) GAMBLERS.y = o.get("gamblerY").getAsInt();
+            if (o.has("gamblerScale")) GAMBLERS.scale = clampScale(o.get("gamblerScale").getAsFloat());
+            if (o.has("gamblerCount")) gamblerCount = Math.max(1, Math.min(10, o.get("gamblerCount").getAsInt()));
         } catch (Exception ignored) {
             // bad or missing config: just use defaults
         }
@@ -421,10 +514,16 @@ public class DonutPayClient implements ClientModInitializer {
         try {
             JsonObject o = new JsonObject();
             o.addProperty("buttonColor", buttonColor);
-            o.addProperty("hudColor", hudColor);
-            o.addProperty("hudX", hudX);
-            o.addProperty("hudY", hudY);
-            o.addProperty("hudScale", hudScale);
+            o.addProperty("hudColor", PROFIT.color);
+            o.addProperty("hudX", PROFIT.x);
+            o.addProperty("hudY", PROFIT.y);
+            o.addProperty("hudScale", PROFIT.scale);
+            o.addProperty("gamblersEnabled", gamblersEnabled);
+            o.addProperty("gamblerColor", GAMBLERS.color);
+            o.addProperty("gamblerX", GAMBLERS.x);
+            o.addProperty("gamblerY", GAMBLERS.y);
+            o.addProperty("gamblerScale", GAMBLERS.scale);
+            o.addProperty("gamblerCount", gamblerCount);
             Files.writeString(configPath(), o.toString());
         } catch (Exception ignored) {
             // not fatal
@@ -466,55 +565,116 @@ public class DonutPayClient implements ClientModInitializer {
     // ================================================================== settings GUI
     static final class SettingsScreen extends Screen {
         private static final int PW = 250;
-        private static final int PH = 200;
+        private static final int PH = 222;
         private static final int SW = 22;   // swatch width
         private static final int GAP = 2;
 
-        private int px, py, rowX;
-        private ButtonWidget toggleButton;
+        private int px, py, rowX, rowW;
+        private int tab = 0; // 0 = General, 1 = Top Gamblers
+        private final List<ButtonWidget> generalWidgets = new ArrayList<>();
+        private final List<ButtonWidget> gamblerWidgets = new ArrayList<>();
+        private ButtonWidget gamblerToggle;
 
         SettingsScreen() {
             super(Text.literal("DonutPay Settings"));
         }
 
+        private ButtonWidget add(List<ButtonWidget> list, ButtonWidget w) {
+            this.addDrawableChild(w);
+            list.add(w);
+            return w;
+        }
+
         @Override
         protected void init() {
+            generalWidgets.clear();
+            gamblerWidgets.clear();
             px = (this.width - PW) / 2;
             py = (this.height - PH) / 2;
-            int rowW = COLOR_VALUES.length * SW + (COLOR_VALUES.length - 1) * GAP;
+            rowW = COLOR_VALUES.length * SW + (COLOR_VALUES.length - 1) * GAP;
             rowX = px + (PW - rowW) / 2;
+            int half = (rowW - GAP * 2) / 2;
 
-            // color swatches (the colored squares are drawn on top in render())
+            // ---- tab buttons (always visible)
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("General"), b -> {
+                tab = 0;
+                applyTab();
+            }).dimensions(rowX, py + 8, half, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("Top Gamblers"), b -> {
+                tab = 1;
+                applyTab();
+            }).dimensions(rowX + half + GAP * 2, py + 8, half, 18).build());
+
+            // ---- General tab
             for (int i = 0; i < COLOR_VALUES.length; i++) {
                 final int color = COLOR_VALUES[i];
                 int x = rowX + i * (SW + GAP);
-                this.addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
+                add(generalWidgets, ButtonWidget.builder(Text.empty(), b -> {
                     buttonColor = color;
                     saveConfig();
-                }).dimensions(x, py + 38, SW, 20).build());
-                this.addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
-                    hudColor = color;
+                }).dimensions(x, py + 46, SW, 20).build());
+                add(generalWidgets, ButtonWidget.builder(Text.empty(), b -> {
+                    PROFIT.color = color;
                     saveConfig();
-                }).dimensions(x, py + 80, SW, 20).build());
+                }).dimensions(x, py + 88, SW, 20).build());
             }
-
-            this.addDrawableChild(ButtonWidget.builder(Text.literal("Edit HUD (move / resize)"),
-                            b -> this.client.setScreen(new HudEditScreen(this)))
-                    .dimensions(rowX, py + 112, rowW, 20).build());
-
-            int half = (rowW - GAP * 2) / 2;
-            toggleButton = ButtonWidget.builder(Text.literal(active ? "Stop session" : "Start session"), b -> {
+            add(generalWidgets, ButtonWidget.builder(Text.literal("Edit profit HUD (move / resize)"),
+                            b -> this.client.setScreen(new HudEditScreen(this, PROFIT)))
+                    .dimensions(rowX, py + 120, rowW, 20).build());
+            add(generalWidgets, ButtonWidget.builder(Text.literal(active ? "Stop session" : "Start session"), b -> {
                 if (active) stopSession();
                 else startSession();
                 b.setMessage(Text.literal(active ? "Stop session" : "Start session"));
-            }).dimensions(rowX, py + 138, half, 20).build();
-            this.addDrawableChild(toggleButton);
+            }).dimensions(rowX, py + 146, half, 20).build());
+            add(generalWidgets, ButtonWidget.builder(Text.literal("Reset numbers"), b -> resetSession())
+                    .dimensions(rowX + half + GAP * 2, py + 146, half, 20).build());
 
-            this.addDrawableChild(ButtonWidget.builder(Text.literal("Reset numbers"), b -> resetSession())
-                    .dimensions(rowX + half + GAP * 2, py + 138, half, 20).build());
+            // ---- Top Gamblers tab
+            gamblerToggle = add(gamblerWidgets, ButtonWidget.builder(gamblerToggleText(), b -> {
+                gamblersEnabled = !gamblersEnabled;
+                saveConfig();
+                b.setMessage(gamblerToggleText());
+            }).dimensions(rowX, py + 34, rowW, 20).build());
+            for (int i = 0; i < COLOR_VALUES.length; i++) {
+                final int color = COLOR_VALUES[i];
+                int x = rowX + i * (SW + GAP);
+                add(gamblerWidgets, ButtonWidget.builder(Text.empty(), b -> {
+                    GAMBLERS.color = color;
+                    saveConfig();
+                }).dimensions(x, py + 74, SW, 20).build());
+            }
+            add(gamblerWidgets, ButtonWidget.builder(Text.literal("-"), b -> {
+                gamblerCount = Math.max(1, gamblerCount - 1);
+                saveConfig();
+            }).dimensions(rowX, py + 104, 30, 20).build());
+            add(gamblerWidgets, ButtonWidget.builder(Text.literal("+"), b -> {
+                gamblerCount = Math.min(10, gamblerCount + 1);
+                saveConfig();
+            }).dimensions(rowX + rowW - 30, py + 104, 30, 20).build());
+            add(gamblerWidgets, ButtonWidget.builder(Text.literal("Edit list (move / resize)"),
+                            b -> this.client.setScreen(new HudEditScreen(this, GAMBLERS)))
+                    .dimensions(rowX, py + 132, rowW, 20).build());
 
+            // ---- Done (always visible)
             this.addDrawableChild(ButtonWidget.builder(Text.literal("Done"), b -> this.close())
-                    .dimensions(rowX, py + 168, rowW, 20).build());
+                    .dimensions(rowX, py + 194, rowW, 20).build());
+
+            applyTab();
+        }
+
+        private Text gamblerToggleText() {
+            return Text.literal("Top Gamblers panel: " + (gamblersEnabled ? "ON" : "OFF"));
+        }
+
+        private void applyTab() {
+            for (ButtonWidget w : generalWidgets) {
+                w.visible = tab == 0;
+                w.active = tab == 0;
+            }
+            for (ButtonWidget w : gamblerWidgets) {
+                w.visible = tab == 1;
+                w.active = tab == 1;
+            }
         }
 
         @Override
@@ -528,14 +688,29 @@ public class DonutPayClient implements ClientModInitializer {
         public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
             super.render(ctx, mouseX, mouseY, delta);
 
-            ctx.drawCenteredTextWithShadow(this.textRenderer, "DonutPay Settings", this.width / 2, py + 10, 0xFFFFFFFF);
-            ctx.drawText(this.textRenderer, "Button color: " + colorName(buttonColor), rowX, py + 26, 0xFFAAAAAA, false);
-            ctx.drawText(this.textRenderer, "Profit HUD color: " + colorName(hudColor), rowX, py + 68, 0xFFAAAAAA, false);
+            // highlight the active tab
+            int half = (rowW - GAP * 2) / 2;
+            int tabX = tab == 0 ? rowX : rowX + half + GAP * 2;
+            ctx.drawStrokedRectangle(tabX, py + 8, half, 18, 0xFFFFFFFF);
 
-            for (int i = 0; i < COLOR_VALUES.length; i++) {
-                int x = rowX + i * (SW + GAP);
-                drawSwatch(ctx, x, py + 38, COLOR_VALUES[i], buttonColor == COLOR_VALUES[i]);
-                drawSwatch(ctx, x, py + 80, COLOR_VALUES[i], hudColor == COLOR_VALUES[i]);
+            if (tab == 0) {
+                ctx.drawText(this.textRenderer, "Button color: " + colorName(buttonColor), rowX, py + 34, 0xFFAAAAAA, false);
+                ctx.drawText(this.textRenderer, "Profit HUD color: " + colorName(PROFIT.color), rowX, py + 76, 0xFFAAAAAA, false);
+                for (int i = 0; i < COLOR_VALUES.length; i++) {
+                    int x = rowX + i * (SW + GAP);
+                    drawSwatch(ctx, x, py + 46, COLOR_VALUES[i], buttonColor == COLOR_VALUES[i]);
+                    drawSwatch(ctx, x, py + 88, COLOR_VALUES[i], PROFIT.color == COLOR_VALUES[i]);
+                }
+            } else {
+                ctx.drawText(this.textRenderer, "List color: " + colorName(GAMBLERS.color), rowX, py + 62, 0xFFAAAAAA, false);
+                for (int i = 0; i < COLOR_VALUES.length; i++) {
+                    int x = rowX + i * (SW + GAP);
+                    drawSwatch(ctx, x, py + 74, COLOR_VALUES[i], GAMBLERS.color == COLOR_VALUES[i]);
+                }
+                ctx.drawCenteredTextWithShadow(this.textRenderer, "Show top " + gamblerCount,
+                        this.width / 2, py + 110, 0xFFFFFFFF);
+                ctx.drawCenteredTextWithShadow(this.textRenderer, "Who paid you the most this session",
+                        this.width / 2, py + 160, 0xFF888888);
             }
         }
 
@@ -560,13 +735,15 @@ public class DonutPayClient implements ClientModInitializer {
     // ================================================================== HUD editor
     static final class HudEditScreen extends Screen {
         private final Screen parent;
+        final PanelCfg panel;
         private boolean dragging = false;
         private boolean wasDown = false;
         private int grabX, grabY;
 
-        HudEditScreen(Screen parent) {
+        HudEditScreen(Screen parent, PanelCfg panel) {
             super(Text.literal("Edit HUD"));
             this.parent = parent;
+            this.panel = panel;
         }
 
         @Override
@@ -578,9 +755,7 @@ public class DonutPayClient implements ClientModInitializer {
             this.addDrawableChild(ButtonWidget.builder(Text.literal("+"), b -> changeScale(0.1f))
                     .dimensions(bx + 34, by, 30, 20).build());
             this.addDrawableChild(ButtonWidget.builder(Text.literal("Reset"), b -> {
-                hudX = 5;
-                hudY = 40;
-                hudScale = 1.0f;
+                panel.resetPosition();
                 saveConfig();
             }).dimensions(bx + 68, by, 60, 20).build());
             this.addDrawableChild(ButtonWidget.builder(Text.literal("Done"), b -> this.close())
@@ -588,11 +763,11 @@ public class DonutPayClient implements ClientModInitializer {
         }
 
         private void changeScale(float delta) {
-            hudScale = Math.max(0.5f, Math.min(3.0f, Math.round((hudScale + delta) * 20f) / 20f));
+            panel.scale = clampScale(Math.round((panel.scale + delta) * 20f) / 20f);
             saveConfig();
         }
 
-        // no dark/blurred background: we want to see the HUD and the game behind it
+        // no dark/blurred background: we want to see the panel and the game behind it
         @Override
         public void renderBackground(DrawContext ctx, int mouseX, int mouseY, float delta) {
         }
@@ -600,30 +775,30 @@ public class DonutPayClient implements ClientModInitializer {
         @Override
         public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
             MinecraftClient mc = MinecraftClient.getInstance();
-            int w = hudWidth(mc.textRenderer);
-            int h = hudHeight();
+            int w = panelWidth(mc, panel, true);
+            int h = panelHeight(panel, true);
 
             // dragging: poll the left mouse button
             boolean down = GLFW.glfwGetMouseButton(GLFW.glfwGetCurrentContext(), GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
-            boolean inside = mouseX >= hudX && mouseX <= hudX + w && mouseY >= hudY && mouseY <= hudY + h;
+            boolean inside = mouseX >= panel.x && mouseX <= panel.x + w && mouseY >= panel.y && mouseY <= panel.y + h;
             if (down && !wasDown && inside && mouseY < this.height - 34) {
                 dragging = true;
-                grabX = mouseX - hudX;
-                grabY = mouseY - hudY;
+                grabX = mouseX - panel.x;
+                grabY = mouseY - panel.y;
             }
             if (!down) {
                 if (dragging) saveConfig();
                 dragging = false;
             }
             if (dragging) {
-                hudX = mouseX - grabX;
-                hudY = mouseY - grabY;
+                panel.x = mouseX - grabX;
+                panel.y = mouseY - grabY;
             }
             wasDown = down;
-            clampHud(mc, this.width, this.height);
+            clampPanel(mc, panel, this.width, this.height, true);
 
-            drawHud(ctx, mc);
-            ctx.drawStrokedRectangle(hudX - 2, hudY - 2, w + 4, h + 4, 0xFFFFFFFF);
+            drawPanel(ctx, mc, panel, true);
+            ctx.drawStrokedRectangle(panel.x - 2, panel.y - 2, w + 4, h + 4, 0xFFFFFFFF);
 
             ctx.drawCenteredTextWithShadow(this.textRenderer, "Drag the box to move it. Scroll wheel or +/- to resize.",
                     this.width / 2, this.height - 46, 0xFFFFFFFF);
