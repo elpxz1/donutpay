@@ -2,9 +2,6 @@ package dev.donutpay;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.arguments.LongArgumentType;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -17,9 +14,6 @@ import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
-import net.minecraft.text.ClickEvent;
-import net.minecraft.text.HoverEvent;
-import net.minecraft.text.MutableText;
 import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.text.TextColor;
@@ -32,7 +26,6 @@ import java.nio.file.Path;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -40,7 +33,6 @@ import java.util.regex.Pattern;
 
 /**
  * DonutPay
- *  - Orange [2x] [Bal] [Payback] buttons when someone pays you.
  *  - /dpay            opens the settings GUI (General tab + Top Gamblers tab)
  *  - /dpay start|stop starts / ends a profit-tracking session (the panels only show during a session)
  *  - Top Gamblers panel = who paid you the most during the current session
@@ -78,7 +70,6 @@ public class DonutPayClient implements ClientModInitializer {
     static final PanelCfg GAMBLERS = new PanelCfg(5, 105, 0xFFA500);
 
     // ------------------------------------------------------------------ saved settings
-    static int buttonColor = 0xFFA500;
     static boolean gamblersEnabled = true;
     static int gamblerCount = 5;
 
@@ -107,25 +98,6 @@ public class DonutPayClient implements ClientModInitializer {
             Pattern.CASE_INSENSITIVE);
     private static final Pattern TAX = Pattern.compile(
             "\\+\\s*\\$?\\s*([\\d,]*\\.?\\d+)\\s*([kKmMbBtT]?)\\s*tax", Pattern.CASE_INSENSITIVE);
-
-    private static final Map<Integer, Payment> PAYMENTS = new LinkedHashMap<>() {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<Integer, Payment> eldest) {
-            return size() > 200;
-        }
-    };
-    private static int nextId = 1;
-
-    private static final class Payment {
-        final String name;
-        final long amount;
-        boolean paidBack = false;
-
-        Payment(String name, long amount) {
-            this.name = name;
-            this.amount = amount;
-        }
-    }
 
     // ================================================================== init
     @Override
@@ -195,24 +167,7 @@ public class DonutPayClient implements ClientModInitializer {
                             info("Debug " + (debug ? "ON - pay messages will be shown as RAW" : "OFF"));
                             return 1;
                         }))
-                        // internal: used by the clickable buttons
-                        .then(ClientCommandManager.literal("act")
-                                .then(ClientCommandManager.argument("id", IntegerArgumentType.integer())
-                                        .then(ClientCommandManager.argument("action", StringArgumentType.word())
-                                                .executes(ctx -> {
-                                                    act(IntegerArgumentType.getInteger(ctx, "id"),
-                                                            StringArgumentType.getString(ctx, "action"));
-                                                    return 1;
-                                                }))))
-                        // /dpay test <name> <amount>  -> fake a payment to see the buttons
-                        .then(ClientCommandManager.literal("test")
-                                .then(ClientCommandManager.argument("name", StringArgumentType.word())
-                                        .then(ClientCommandManager.argument("amount", LongArgumentType.longArg(1))
-                                                .executes(ctx -> {
-                                                    show(StringArgumentType.getString(ctx, "name"),
-                                                            LongArgumentType.getLong(ctx, "amount"));
-                                                    return 1;
-                                                }))))));
+                        ));
     }
 
     // ================================================================== chat handling
@@ -259,74 +214,13 @@ public class DonutPayClient implements ClientModInitializer {
             countIn++;
             gamblers.merge(name, amount, Long::sum);
         }
-        MinecraftClient.getInstance().execute(() -> show(name, amount));
-    }
-
-    private static void show(String name, long amount) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.inGameHud == null) return;
-
-        int id = nextId++;
-        PAYMENTS.put(id, new Payment(name, amount));
-
-        long doubled = amount * 2;
-        MutableText line = Text.literal("» ").setStyle(Style.EMPTY.withColor(TextColor.fromRgb(buttonColor)));
-        line.append(button("[2x]", id, "2x", "Pay " + name + " $" + compact(doubled)));
-        line.append(Text.literal(" "));
-        line.append(button("[Bal]", id, "bal", "Run /bal " + name));
-        line.append(Text.literal(" "));
-        line.append(button("[Payback]", id, "payback", "Pay " + name + " $" + compact(amount)));
-        line.append(Text.literal("  " + name + " paid $" + compact(amount))
-                .setStyle(Style.EMPTY.withColor(Formatting.GRAY)));
-
-        mc.inGameHud.getChatHud().addMessage(line);
-    }
-
-    private static MutableText button(String label, int id, String action, String tooltip) {
-        return Text.literal(label).setStyle(Style.EMPTY
-                .withColor(TextColor.fromRgb(buttonColor))
-                .withBold(true)
-                .withClickEvent(new ClickEvent.RunCommand("/dpay act " + id + " " + action))
-                .withHoverEvent(new HoverEvent.ShowText(Text.literal(tooltip))));
-    }
-
-    private static void act(int id, String action) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.getNetworkHandler() == null || mc.player == null) return;
-
-        Payment p = PAYMENTS.get(id);
-        if (p == null) {
-            info("That payment is too old, button expired.");
-            return;
-        }
-
-        switch (action) {
-            case "bal" -> mc.getNetworkHandler().sendChatCommand("bal " + p.name);
-            case "2x", "payback" -> {
-                if (p.paidBack) {
-                    info("You already paid " + p.name + " back for this one.");
-                    return;
-                }
-                long out;
-                try {
-                    out = action.equals("2x") ? Math.multiplyExact(p.amount, 2L) : p.amount;
-                } catch (ArithmeticException e) {
-                    info("Amount too large.");
-                    return;
-                }
-                p.paidBack = true;
-                // plain digits so the server always understands the amount
-                mc.getNetworkHandler().sendChatCommand("pay " + p.name + " " + out);
-            }
-            default -> info("Unknown action.");
-        }
     }
 
     static void info(String msg) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.inGameHud != null) {
             mc.inGameHud.getChatHud().addMessage(Text.literal("[DonutPay] " + msg)
-                    .setStyle(Style.EMPTY.withColor(TextColor.fromRgb(buttonColor))));
+                    .setStyle(Style.EMPTY.withColor(TextColor.fromRgb(PROFIT.color))));
         }
     }
 
@@ -494,7 +388,6 @@ public class DonutPayClient implements ClientModInitializer {
             Path p = configPath();
             if (!Files.exists(p)) return;
             JsonObject o = JsonParser.parseString(Files.readString(p)).getAsJsonObject();
-            if (o.has("buttonColor")) buttonColor = o.get("buttonColor").getAsInt();
             if (o.has("hudColor")) PROFIT.color = o.get("hudColor").getAsInt();
             if (o.has("hudX")) PROFIT.x = o.get("hudX").getAsInt();
             if (o.has("hudY")) PROFIT.y = o.get("hudY").getAsInt();
@@ -513,7 +406,6 @@ public class DonutPayClient implements ClientModInitializer {
     static void saveConfig() {
         try {
             JsonObject o = new JsonObject();
-            o.addProperty("buttonColor", buttonColor);
             o.addProperty("hudColor", PROFIT.color);
             o.addProperty("hudX", PROFIT.x);
             o.addProperty("hudY", PROFIT.y);
@@ -610,24 +502,20 @@ public class DonutPayClient implements ClientModInitializer {
                 final int color = COLOR_VALUES[i];
                 int x = rowX + i * (SW + GAP);
                 add(generalWidgets, ButtonWidget.builder(Text.empty(), b -> {
-                    buttonColor = color;
-                    saveConfig();
-                }).dimensions(x, py + 46, SW, 20).build());
-                add(generalWidgets, ButtonWidget.builder(Text.empty(), b -> {
                     PROFIT.color = color;
                     saveConfig();
-                }).dimensions(x, py + 88, SW, 20).build());
+                }).dimensions(x, py + 46, SW, 20).build());
             }
             add(generalWidgets, ButtonWidget.builder(Text.literal("Edit profit HUD (move / resize)"),
                             b -> this.client.setScreen(new HudEditScreen(this, PROFIT)))
-                    .dimensions(rowX, py + 120, rowW, 20).build());
+                    .dimensions(rowX, py + 80, rowW, 20).build());
             add(generalWidgets, ButtonWidget.builder(Text.literal(active ? "Stop session" : "Start session"), b -> {
                 if (active) stopSession();
                 else startSession();
                 b.setMessage(Text.literal(active ? "Stop session" : "Start session"));
-            }).dimensions(rowX, py + 146, half, 20).build());
+            }).dimensions(rowX, py + 106, half, 20).build());
             add(generalWidgets, ButtonWidget.builder(Text.literal("Reset numbers"), b -> resetSession())
-                    .dimensions(rowX + half + GAP * 2, py + 146, half, 20).build());
+                    .dimensions(rowX + half + GAP * 2, py + 106, half, 20).build());
 
             // ---- Top Gamblers tab
             gamblerToggle = add(gamblerWidgets, ButtonWidget.builder(gamblerToggleText(), b -> {
@@ -694,12 +582,10 @@ public class DonutPayClient implements ClientModInitializer {
             ctx.drawStrokedRectangle(tabX, py + 8, half, 18, 0xFFFFFFFF);
 
             if (tab == 0) {
-                ctx.drawText(this.textRenderer, "Button color: " + colorName(buttonColor), rowX, py + 34, 0xFFAAAAAA, false);
-                ctx.drawText(this.textRenderer, "Profit HUD color: " + colorName(PROFIT.color), rowX, py + 76, 0xFFAAAAAA, false);
+                ctx.drawText(this.textRenderer, "Profit HUD color: " + colorName(PROFIT.color), rowX, py + 34, 0xFFAAAAAA, false);
                 for (int i = 0; i < COLOR_VALUES.length; i++) {
                     int x = rowX + i * (SW + GAP);
-                    drawSwatch(ctx, x, py + 46, COLOR_VALUES[i], buttonColor == COLOR_VALUES[i]);
-                    drawSwatch(ctx, x, py + 88, COLOR_VALUES[i], PROFIT.color == COLOR_VALUES[i]);
+                    drawSwatch(ctx, x, py + 46, COLOR_VALUES[i], PROFIT.color == COLOR_VALUES[i]);
                 }
             } else {
                 ctx.drawText(this.textRenderer, "List color: " + colorName(GAMBLERS.color), rowX, py + 62, 0xFFAAAAAA, false);
